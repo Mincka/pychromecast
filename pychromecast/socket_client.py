@@ -208,6 +208,12 @@ class SocketClient(threading.Thread, CastStatusListener):
         self.connecting = True
         self.first_connection = True
         self.socket: socket.socket | ssl.SSLSocket | None = None
+        # Serializes I/O on self.socket. The worker thread reads while any
+        # thread calling send_message writes, and an OpenSSL SSL object must not
+        # be used by two threads at once. CPython releases the GIL around
+        # SSL_read and SSL_write, so a concurrent recv and sendall corrupt the
+        # TLS state ("bad record mac") and can crash the process with SIGSEGV.
+        self._socket_lock = threading.Lock()
         self.selector = selectors.DefaultSelector()
         self.wakeup_selector_key = self.selector.register(
             self.socketpair[0], selectors.EVENT_READ
@@ -237,8 +243,9 @@ class SocketClient(threading.Thread, CastStatusListener):
 
         if self.socket is not None:
             self.selector.unregister(self.socket)
-            self.socket.close()
-            self.socket = None
+            with self._socket_lock:
+                self.socket.close()
+                self.socket = None
             self.remote_selector_key = None
 
         # Make sure nobody is blocking.
@@ -295,8 +302,9 @@ class SocketClient(threading.Thread, CastStatusListener):
                     if self.socket is not None:
                         # If we retry connecting, we need to clean up the socket again
                         self.selector.unregister(self.socket)
-                        self.socket.close()
-                        self.socket = None
+                        with self._socket_lock:
+                            self.socket.close()
+                            self.socket = None
                         self.remote_selector_key = None
 
                     self.socket = new_socket()
@@ -778,12 +786,13 @@ class SocketClient(threading.Thread, CastStatusListener):
                     pass
 
         if self.socket is not None:
-            try:
-                self.socket.close()
-            except Exception:  # pylint: disable=broad-except
-                self.logger.exception(
-                    "[%s(%s):%s] _cleanup", self.fn or "", self.host, self.port
-                )
+            with self._socket_lock:
+                try:
+                    self.socket.close()
+                except Exception:  # pylint: disable=broad-except
+                    self.logger.exception(
+                        "[%s(%s):%s] _cleanup", self.fn or "", self.host, self.port
+                    )
         self._report_connection_status(
             ConnectionStatus(
                 CONNECTION_STATUS_DISCONNECTED,
@@ -831,7 +840,10 @@ class SocketClient(threading.Thread, CastStatusListener):
             if self.stop.is_set():
                 raise InterruptLoop("Stopped while reading from socket")
             try:
-                chunk = self.socket.recv(min(msglen - bytes_recd, 2048))
+                # Lock each recv call, not the whole message, so that writes
+                # from other threads can go through between chunks.
+                with self._socket_lock:
+                    chunk = self.socket.recv(min(msglen - bytes_recd, 2048))
                 if chunk == b"":
                     raise ChromecastConnectionClosed("Connection was closed by remote")
                 chunks.append(chunk)
@@ -927,7 +939,9 @@ class SocketClient(threading.Thread, CastStatusListener):
                         self._request_callbacks[request_id] = callback_function
                     else:
                         callback_function(True, None)
-                self.socket.sendall(be_size + msg.SerializeToString())
+                payload = be_size + msg.SerializeToString()
+                with self._socket_lock:
+                    self.socket.sendall(payload)
             except socket.error as exc:
                 if callback_function:
                     callback_function(False, None)
