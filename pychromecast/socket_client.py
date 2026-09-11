@@ -930,9 +930,6 @@ class SocketClient(threading.Thread, CastStatusListener):
                 callback_function(False, None)
             raise PyChromecastStopped("Socket client's thread is stopped.")
         if not self.connecting and not self._force_recon:
-            # We have a socket
-            assert self.socket is not None
-
             try:
                 if callback_function:
                     if not no_add_request_id:
@@ -941,6 +938,10 @@ class SocketClient(threading.Thread, CastStatusListener):
                         callback_function(True, None)
                 payload = be_size + msg.SerializeToString()
                 with self._socket_lock:
+                    # The worker thread may have closed the socket to reconnect
+                    # since the check above.
+                    if self.socket is None or self.connecting:
+                        raise OSError(errno.ENOTCONN, "Socket is reconnecting")
                     self.socket.sendall(payload)
             except socket.error as exc:
                 if callback_function:
